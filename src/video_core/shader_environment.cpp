@@ -469,6 +469,16 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
                                                        gpu_memory->UsesNativeTiling())};
     Tegra::Texture::TICEntry entry;
+    const auto null_2d_texture = [&entry] {
+        entry.raw.fill(0);
+        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
+        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
+        entry.normalized_coords.Assign(1);
+    };
     if (index > tic_limit) {
         // Past the pool, the bytes are not a descriptor: reading them gave the shader a random
         // texture type and format (garbage-format asserts, then crashes and device losses on AMD
@@ -480,14 +490,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
                                 "(index {} > limit {}); using a null 2D texture",
                         raw, index, tic_limit);
         }
-        entry.raw.fill(0);
-        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
-        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
-        entry.normalized_coords.Assign(1);
+        null_2d_texture();
         return entry;
     }
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
@@ -495,6 +498,16 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
         gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
     } else {
         gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
+    if (entry.raw == decltype(entry.raw){}) {
+        // An empty descriptor (the null texture, handle 0 in NVN games): a game can draw with it
+        // before it assigns the real texture, and the shader built for that draw is kept for the
+        // pipeline. Read as it is, the zeroes say "1D texture", so a size query of a texture that
+        // turns out 2D (it has no type of its own) got a null 1D view for good: Pokemon Legends
+        // Z-A's tonemap then samples one texel for the whole screen (issue #846). Compile for a
+        // plain 2D RGBA8 texture instead, as for an index past the pool.
+        null_2d_texture();
+        return entry;
     }
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
@@ -1224,6 +1237,11 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
         Shader::TextureType type;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&type), sizeof(type));
+        if (key == 0 && type == Shader::TextureType::Color1D) {
+            // Handle 0 is the null texture. A cache written before ReadTextureInfo stopped
+            // reading its empty descriptor as a 1D texture holds this type for it (issue #846).
+            type = Shader::TextureType::Color2D;
+        }
         texture_types.emplace(key, type);
     }
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
