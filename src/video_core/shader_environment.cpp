@@ -1267,12 +1267,19 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
     }
     if (const auto it{cbuf_values.find(NULL_TEXTURE_2D_KEY)}; it != cbuf_values.end()) {
         cbuf_values.erase(it);
-    } else if (const auto type{texture_types.find(0)};
-               type != texture_types.end() && type->second == Shader::TextureType::Color1D) {
+    } else {
         // An older build may have read the null texture as 1D (issue #846), or the game binds a
-        // real 1D texture there: the record can't tell. Drop the type so that the pipeline is
-        // built again from the game (LacksRecordedValue).
-        texture_types.erase(type);
+        // real 1D texture there: the record can't tell. Drop the type of every handle that
+        // selects descriptor 0, whatever its sampler, so that the pipeline is built again from
+        // the game (LacksRecordedValue).
+        static constexpr u32 TIC_INDEX_MASK{(1U << 20) - 1};
+        for (auto it{texture_types.begin()}; it != texture_types.end();) {
+            if ((it->first & TIC_INDEX_MASK) == 0 && it->second == Shader::TextureType::Color1D) {
+                it = texture_types.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     for (size_t i = 0; i < num_storage_pointer_types; ++i) {
         u64 key;
