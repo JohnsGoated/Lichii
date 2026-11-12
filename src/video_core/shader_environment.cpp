@@ -98,6 +98,11 @@ static constexpr u64 MakeCbufKey(u32 index, u32 offset) {
 // load it as one more value.
 constexpr u64 READ_PROPERTIES_KEY{MakeCbufKey(~0U, 0)};
 
+// Another such value: present in records whose texture types were read as ReadTextureInfo reads
+// an empty descriptor now (a 2D texture). Records without it can hold a 1D type for the null
+// texture at handle 0 (issue #846).
+constexpr u64 NULL_TEXTURE_2D_KEY{MakeCbufKey(~0U, 1)};
+
 // The most values of a kind an environment of a record holds. Translation reads a few hundred at
 // most; a damaged count can't make a load allocate more than a few MB for them.
 constexpr u64 MAX_RECORDED_VALUES{u64{1} << 16};
@@ -339,9 +344,9 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    // The read properties are one more constant buffer value.
+    // The read properties and the null texture marker are two more constant buffer values.
     return !has_unbound_instructions &&
-           std::max({texture_types.size(), texture_pixel_formats.size(), cbuf_values.size() + 1,
+           std::max({texture_types.size(), texture_pixel_formats.size(), cbuf_values.size() + 2,
                      storage_pointer_types.size(), cbuf_replacements.size()}) <=
                MAX_RECORDED_VALUES;
 }
@@ -369,7 +374,7 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
-    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 1};
+    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 2};
     const u64 num_storage_pointer_types{static_cast<u64>(storage_pointer_types.size())};
     const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
 
@@ -403,8 +408,11 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
     }
+    constexpr u32 null_texture_2d{1};
     file.write(reinterpret_cast<const char*>(&READ_PROPERTIES_KEY), sizeof(READ_PROPERTIES_KEY))
-        .write(reinterpret_cast<const char*>(&read_properties), sizeof(read_properties));
+        .write(reinterpret_cast<const char*>(&read_properties), sizeof(read_properties))
+        .write(reinterpret_cast<const char*>(&NULL_TEXTURE_2D_KEY), sizeof(NULL_TEXTURE_2D_KEY))
+        .write(reinterpret_cast<const char*>(&null_texture_2d), sizeof(null_texture_2d));
     for (const auto& [key, type] : storage_pointer_types) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
@@ -1237,11 +1245,6 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
         Shader::TextureType type;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&type), sizeof(type));
-        if (key == 0 && type == Shader::TextureType::Color1D) {
-            // Handle 0 is the null texture. A cache written before ReadTextureInfo stopped
-            // reading its empty descriptor as a 1D texture holds this type for it (issue #846).
-            type = Shader::TextureType::Color2D;
-        }
         texture_types.emplace(key, type);
     }
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
@@ -1261,6 +1264,15 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
     if (const auto it{cbuf_values.find(READ_PROPERTIES_KEY)}; it != cbuf_values.end()) {
         recorded_read_properties = it->second;
         cbuf_values.erase(it);
+    }
+    if (const auto it{cbuf_values.find(NULL_TEXTURE_2D_KEY)}; it != cbuf_values.end()) {
+        cbuf_values.erase(it);
+    } else if (const auto type{texture_types.find(0)};
+               type != texture_types.end() && type->second == Shader::TextureType::Color1D) {
+        // An older build may have read the null texture as 1D (issue #846), or the game binds a
+        // real 1D texture there: the record can't tell. Drop the type so that the pipeline is
+        // built again from the game (LacksRecordedValue).
+        texture_types.erase(type);
     }
     for (size_t i = 0; i < num_storage_pointer_types; ++i) {
         u64 key;
